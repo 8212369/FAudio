@@ -280,8 +280,6 @@ void FAudio_PlatformInit(
 		return;
 	}
 
-	FRingBuffer_Init(&streamCubeb->ringBuffer, latencyFrames * 4 * streamCubeb->channelCount * sizeof(float));
-
 	/* Write up the received format for the engine */
 	WriteWaveFormatExtensible(
 		mixFormat,
@@ -301,6 +299,8 @@ void FAudio_PlatformInit(
 	{
 		*updateSize = mixFormat->Format.nSamplesPerSec / 100;
 	}
+
+	FRingBuffer_Init(&streamCubeb->ringBuffer, *updateSize * 4 * streamCubeb->channelCount * sizeof(float));
 
 	/* SDL_AudioDeviceID is a Uint32, anybody using a 16-bit PC still? */
 	*platformDevice = (void*)streamCubeb;
