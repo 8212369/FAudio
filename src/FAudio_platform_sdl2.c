@@ -30,22 +30,392 @@
 
 #include <SDL.h>
 
+#ifdef FNA_USE_CUBEB_FOR_AUDIO
+#include <cubeb/cubeb.h>
+#endif
+
 #if !SDL_VERSION_ATLEAST(2, 24, 0)
 #error "SDL version older than 2.24.0"
 #endif /* !SDL_VERSION_ATLEAST */
 
 /* Mixer Thread */
 
-static void FAudio_INTERNAL_MixCallback(void *userdata, Uint8 *stream, int len)
+void FAudio_UTF8_To_UTF16(const char* src, uint16_t* dst, size_t len);
+
+#ifdef FNA_USE_CUBEB_FOR_AUDIO
+typedef struct FRingBuffer {
+	uint8_t* buffer;
+	size_t pointer_push;
+	size_t pointer_pop;
+	size_t max;
+	size_t available;
+} FRingBuffer;
+
+static uint8_t FRingBuffer_Init(FRingBuffer* ring, size_t size) {
+	if (!ring) {
+		return 0;
+	}
+
+	ring->buffer = (uint8_t*)malloc(size);
+	ring->pointer_push = 0;
+	ring->pointer_pop = 0;
+	ring->available = 0;
+	ring->max = size;
+
+	if (!ring->buffer) {
+		SDL_Log("No memory to allocate ring buffer!");
+		return 0;
+	}
+
+	return 1;
+}
+
+static void FRingBuffer_Free(FRingBuffer* ring) {
+	free(ring->buffer);
+}
+
+static void FRingBuffer_Push(FRingBuffer* ring, const void* data, size_t size) {
+	if (ring->max < size) {
+		SDL_Log("Pushing too much for one ring buffer push session!");
+		return;
+	}
+
+	ring->available += size;
+
+	size_t firstPassPushSize = size;
+	if (ring->pointer_push + size > ring->max) {
+		firstPassPushSize = ring->max - ring->pointer_push;
+	}
+
+	SDL_memcpy(ring->buffer + ring->pointer_push, data, firstPassPushSize);
+	if (firstPassPushSize == size) {
+		ring->pointer_push += size;
+		return;
+	}
+
+	size_t secondPassPushSize = size - firstPassPushSize;
+	SDL_memcpy(ring->buffer, (uint8_t*)data + firstPassPushSize, secondPassPushSize);
+	ring->pointer_push = secondPassPushSize;
+}
+
+static size_t FRingBuffer_UnreadByteCount(FRingBuffer* ring) {
+	return ring->available;
+}
+
+static void FRingBuffer_Pop(FRingBuffer* ring, void* data, size_t* count) {
+	if (!ring || !count) {
+		SDL_Log("One of the argument in pop is null!");
+		return;
+	}
+
+	size_t actualPopCount = FAudio_min(FAudio_min(*count, ring->available), ring->max);
+	size_t popCountPass1 = FAudio_min(actualPopCount, ring->max - ring->pointer_pop);
+
+	SDL_memcpy(data, ring->buffer + ring->pointer_pop, popCountPass1);
+
+	if (popCountPass1 != actualPopCount) {
+		size_t popCountPass2 = actualPopCount - popCountPass1;
+
+		SDL_memcpy((uint8_t*)data + popCountPass1, ring->buffer, popCountPass2);
+		ring->pointer_pop = popCountPass2;
+	}
+	else {
+		ring->pointer_pop += actualPopCount;
+	}
+
+	ring->available -= actualPopCount;
+	*count = actualPopCount;
+}
+
+static cubeb* CubebContext = NULL;
+static cubeb_device_collection CubebDeviceCollection;
+static int CubebContextRefCount = 0;
+
+typedef struct FCubebAudioStream {
+	cubeb_stream* stream;
+	FRingBuffer ringBuffer;
+	int channelCount;
+	float* tempBuffer;
+} FCubebAudioStream;
+
+static void FNA_Internal_StateCallback(cubeb_stream* stream, void* user_data, cubeb_state state) {
+}
+
+static long FAudio_INTERNAL_MixCallback(cubeb_stream* stm, void* user,
+	const void* input_buffer, void* output_buffer, long nframes)
 {
-	FAudio *audio = (FAudio*) userdata;
+	FAudio* audio = (FAudio*)user;
+	FCubebAudioStream* fcubeb = (FCubebAudioStream*)audio->platform;
+
+	FAudio_zero(output_buffer, nframes * fcubeb->channelCount * sizeof(float));
+
+	if (audio->active)
+	{
+		const size_t goalFrames = (size_t)nframes;
+		size_t accumulatedFrames = 0;
+
+		float* outPointer = (float*)output_buffer;
+
+		if (FRingBuffer_UnreadByteCount(&fcubeb->ringBuffer) != 0) {
+			accumulatedFrames = goalFrames * fcubeb->channelCount * sizeof(float);
+			FRingBuffer_Pop(&fcubeb->ringBuffer, outPointer, &accumulatedFrames);
+
+			outPointer += accumulatedFrames / sizeof(float);
+			accumulatedFrames /= (fcubeb->channelCount * sizeof(float));
+		}
+
+		while (accumulatedFrames < goalFrames) {
+			if (accumulatedFrames + audio->updateSize > goalFrames) {
+				if (!fcubeb->tempBuffer) {
+					fcubeb->tempBuffer = (float*)malloc(audio->updateSize * fcubeb->channelCount * sizeof(float));
+				}
+
+				FAudio_zero(fcubeb->tempBuffer, audio->updateSize * fcubeb->channelCount * sizeof(float));
+
+				FAudio_INTERNAL_UpdateEngine(
+					audio,
+					fcubeb->tempBuffer
+				);
+
+				size_t framesToUse = goalFrames - accumulatedFrames;
+				SDL_memcpy(outPointer, fcubeb->tempBuffer, framesToUse * fcubeb->channelCount * sizeof(float));
+
+				FRingBuffer_Push(&fcubeb->ringBuffer, fcubeb->tempBuffer + framesToUse * fcubeb->channelCount,
+					(audio->updateSize - framesToUse) * fcubeb->channelCount * sizeof(float));
+			} else {
+				FAudio_INTERNAL_UpdateEngine(
+					audio,
+					outPointer
+				);
+			}
+
+			outPointer += audio->updateSize * fcubeb->channelCount;
+			accumulatedFrames += audio->updateSize;
+		}
+	}
+
+	return nframes;
+}
+static void FAudio_InitCubebInstance()
+{
+	if (CubebContext) {
+		return;
+	}
+
+	cubeb_init(&CubebContext, "FAudio", NULL);
+	cubeb_enumerate_devices(CubebContext, CUBEB_DEVICE_TYPE_OUTPUT, &CubebDeviceCollection);
+}
+
+void FAudio_PlatformAddRef()
+{
+	if (CubebContextRefCount == 0) {
+		FAudio_InitCubebInstance();
+
+		FAudio_INTERNAL_InitSIMDFunctions(
+			SDL_HasSSE2(),
+			SDL_HasNEON()
+		);
+	}
+
+	CubebContextRefCount++;
+}
+
+void FAudio_PlatformRelease()
+{
+	CubebContextRefCount--;
+	if (CubebContextRefCount == 0) {
+		cubeb_device_collection_destroy(CubebContext, &CubebDeviceCollection);
+		cubeb_destroy(CubebContext);
+	}
+}
+
+void FAudio_PlatformInit(
+	FAudio *audio,
+	uint32_t flags,
+	uint32_t deviceIndex,
+	FAudioWaveFormatExtensible *mixFormat,
+	uint32_t *updateSize,
+	void** platformDevice
+) {
+	*platformDevice = NULL;
+
+	FCubebAudioStream* streamCubeb = (FCubebAudioStream*)calloc(1, sizeof(FCubebAudioStream));
+	streamCubeb->channelCount = mixFormat->Format.nChannels;
+
+	cubeb_stream_params outParams;
+	outParams.format = CUBEB_SAMPLE_FLOAT32NE;
+	outParams.rate = mixFormat->Format.nSamplesPerSec;
+	outParams.channels = mixFormat->Format.nChannels;
+	outParams.layout = (mixFormat->Format.nChannels == 1) ? CUBEB_LAYOUT_MONO : CUBEB_LAYOUT_STEREO;
+	outParams.prefs = CUBEB_STREAM_PREF_NONE;
+
+	FAudio_PlatformAddRef();
+
+	uint32_t latencyFrames;
+
+	int result = cubeb_get_min_latency(CubebContext, &outParams, &latencyFrames);
+	if (result != CUBEB_OK) {
+		SDL_Log("Could not get minimum latency, use default");
+		latencyFrames = 256;
+	}
+
+	cubeb_devid outDeviceId = NULL;
+	if (deviceIndex != 0) {
+		if (deviceIndex > CubebDeviceCollection.count) {
+			SDL_Log("Out-of-range device index given to platform init!");
+			return;
+		}
+
+		outDeviceId = CubebDeviceCollection.device[deviceIndex - 1].device_id;
+	}
+
+	result = cubeb_stream_init(CubebContext, &streamCubeb->stream, "FAudio Stream \"Device\"",
+		NULL, outDeviceId, NULL, &outParams, latencyFrames, FAudio_INTERNAL_MixCallback, FNA_Internal_StateCallback,
+		audio);
+
+	if ((result != CUBEB_OK) || (streamCubeb->stream == NULL)) {
+		FAudio_PlatformRelease();
+
+		SDL_Log("Failed to create Cubeb stream!");
+		return;
+	}
+
+	FRingBuffer_Init(&streamCubeb->ringBuffer, latencyFrames * 4 * streamCubeb->channelCount * sizeof(float));
+
+	/* Write up the received format for the engine */
+	WriteWaveFormatExtensible(
+		mixFormat,
+		streamCubeb->channelCount,
+		mixFormat->Format.nSamplesPerSec,
+		&DATAFORMAT_SUBTYPE_IEEE_FLOAT
+	);
+
+	if (flags & FAUDIO_1024_QUANTUM)
+	{
+		/* Get the sample count for a 21.33ms frame.
+		 * For 48KHz this should be 1024.
+		 */
+		*updateSize = (int)(mixFormat->Format.nSamplesPerSec / (1000.0 / (64.0 / 3.0)));
+	}
+	else
+	{
+		*updateSize = mixFormat->Format.nSamplesPerSec / 100;
+	}
+
+	/* SDL_AudioDeviceID is a Uint32, anybody using a 16-bit PC still? */
+	*platformDevice = (void*)streamCubeb;
+
+	/* Start the thread! */
+	cubeb_stream_set_volume(streamCubeb->stream, 1.0f);
+	cubeb_stream_start(streamCubeb->stream);
+}
+
+void FAudio_PlatformQuit(void* platformDevice)
+{
+	FCubebAudioStream* stream = (FCubebAudioStream*)platformDevice;
+	cubeb_stream_stop(stream->stream);
+	cubeb_stream_destroy(stream->stream);
+	if (stream->tempBuffer) {
+		free(stream->tempBuffer);
+	}
+
+	FRingBuffer_Free(&stream->ringBuffer);
+	free(stream);
+
+	FAudio_PlatformRelease();
+}
+
+uint32_t FAudio_PlatformGetDeviceCount()
+{
+	FAudio_InitCubebInstance();
+	return (uint32_t)CubebDeviceCollection.count;
+}
+
+uint32_t FAudio_PlatformGetDeviceDetails(
+	uint32_t index,
+	FAudioDeviceDetails* details
+) {
+	FAudio_InitCubebInstance();
+
+	if (index >= CubebDeviceCollection.count) {
+		SDL_Log("Out-of-range device index given to platform get device details!");
+		return FAUDIO_E_INVALID_CALL;
+	}
+
+	const char* name, * envvar;
+	int channels, rate;
+
+	details->DeviceID[0] = L'0' + index;
+
+	name = CubebDeviceCollection.device[index].friendly_name;
+	details->Role = FAudioNotDefaultDevice;
+
+	FAudio_UTF8_To_UTF16(
+		name,
+		(uint16_t*)details->DisplayName,
+		sizeof(details->DisplayName)
+	);
+
+	/* Environment variables take precedence over all possible values */
+	envvar = SDL_getenv("SDL_AUDIO_FREQUENCY");
+	if (envvar != NULL)
+	{
+		rate = SDL_atoi(envvar);
+	}
+	else
+	{
+		rate = 0;
+	}
+	envvar = SDL_getenv("SDL_AUDIO_CHANNELS");
+	if (envvar != NULL)
+	{
+		channels = SDL_atoi(envvar);
+	}
+	else
+	{
+		channels = 0;
+	}
+
+	if (rate <= 0)
+	{
+		rate = (int)CubebDeviceCollection.device[index].default_rate;
+	}
+	if (channels <= 0)
+	{
+		channels = (int)CubebDeviceCollection.device[index].max_channels;
+	}
+
+	/* If we make it all the way here with no format, hardcode a sane one */
+	if (rate <= 0)
+	{
+		rate = 48000;
+	}
+	if (channels <= 0)
+	{
+		channels = 2;
+	}
+
+	/* Write the format, finally. */
+	WriteWaveFormatExtensible(
+		&details->OutputFormat,
+		channels,
+		rate,
+		&DATAFORMAT_SUBTYPE_PCM
+	);
+
+	return 0;
+}
+#else
+static void FAudio_INTERNAL_MixCallback(void* userdata, Uint8* stream, int len)
+{
+	FAudio* audio = (FAudio*)userdata;
 
 	FAudio_zero(stream, len);
 	if (audio->active)
 	{
 		FAudio_INTERNAL_UpdateEngine(
 			audio,
-			(float*) stream
+			(float*)stream
 		);
 	}
 }
@@ -68,7 +438,7 @@ static void FAudio_INTERNAL_PrioritizeDirectSound()
 	directsound = -1;
 	for (i = 0; i < numdrivers; i += 1)
 	{
-		const char *driver = SDL_GetAudioDriver(i);
+		const char* driver = SDL_GetAudioDriver(i);
 		if (SDL_strcmp(driver, "wasapi") == 0)
 		{
 			wasapi = i;
@@ -111,11 +481,11 @@ void FAudio_PlatformRelease()
 }
 
 void FAudio_PlatformInit(
-	FAudio *audio,
+	FAudio* audio,
 	uint32_t flags,
 	uint32_t deviceIndex,
-	FAudioWaveFormatExtensible *mixFormat,
-	uint32_t *updateSize,
+	FAudioWaveFormatExtensible* mixFormat,
+	uint32_t* updateSize,
 	void** platformDevice
 ) {
 	SDL_AudioDeviceID device;
@@ -136,9 +506,9 @@ void FAudio_PlatformInit(
 		/* Get the sample count for a 21.33ms frame.
 		 * For 48KHz this should be 1024.
 		 */
-		want.samples = (int) (
+		want.samples = (int)(
 			want.freq / (1000.0 / (64.0 / 3.0))
-		);
+			);
 	}
 	else
 	{
@@ -156,7 +526,7 @@ iosretry:
 	);
 	if (device == 0)
 	{
-		const char *err = SDL_GetError();
+		const char* err = SDL_GetError();
 		SDL_Log("OpenAudioDevice failed: %s", err);
 
 		/* iOS has a weird thing where you can't open a stream when the
@@ -189,7 +559,7 @@ iosretry:
 	*updateSize = have.samples;
 
 	/* SDL_AudioDeviceID is a Uint32, anybody using a 16-bit PC still? */
-	*platformDevice = (void*) ((size_t) device);
+	*platformDevice = (void*)((size_t)device);
 
 	/* Start the thread! */
 	SDL_PauseAudioDevice(device, 0);
@@ -197,7 +567,7 @@ iosretry:
 
 void FAudio_PlatformQuit(void* platformDevice)
 {
-	SDL_CloseAudioDevice((SDL_AudioDeviceID) ((size_t) platformDevice));
+	SDL_CloseAudioDevice((SDL_AudioDeviceID)((size_t)platformDevice));
 }
 
 uint32_t FAudio_PlatformGetDeviceCount()
@@ -210,13 +580,11 @@ uint32_t FAudio_PlatformGetDeviceCount()
 	return devCount + 1; /* Add one for "Default Device" */
 }
 
-void FAudio_UTF8_To_UTF16(const char *src, uint16_t *dst, size_t len);
-
 uint32_t FAudio_PlatformGetDeviceDetails(
 	uint32_t index,
-	FAudioDeviceDetails *details
+	FAudioDeviceDetails* details
 ) {
-	const char *name, *envvar;
+	const char* name, * envvar;
 	int channels, rate;
 	SDL_AudioSpec spec;
 	uint32_t devcount;
@@ -243,7 +611,7 @@ uint32_t FAudio_PlatformGetDeviceDetails(
 		{
 			FAudio_UTF8_To_UTF16(
 				envvar,
-				(uint16_t*) details->DeviceID,
+				(uint16_t*)details->DeviceID,
 				sizeof(details->DeviceID)
 			);
 		}
@@ -255,7 +623,7 @@ uint32_t FAudio_PlatformGetDeviceDetails(
 	}
 	FAudio_UTF8_To_UTF16(
 		name,
-		(uint16_t*) details->DisplayName,
+		(uint16_t*)details->DisplayName,
 		sizeof(details->DisplayName)
 	);
 
@@ -320,6 +688,7 @@ uint32_t FAudio_PlatformGetDeviceDetails(
 	return 0;
 }
 
+#endif
 /* Threading */
 
 FAudioThread FAudio_PlatformCreateThread(

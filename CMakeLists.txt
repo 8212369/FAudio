@@ -14,6 +14,8 @@ option(LOG_ASSERTIONS "Bind FAudio_assert to log, instead of platform's assert" 
 option(FORCE_ENABLE_DEBUGCONFIGURATION "Enable DebugConfiguration in all build types" OFF)
 option(DUMP_VOICES "Dump voices to RIFF WAVE files" OFF)
 option(BUILD_SHARED_LIBS "Build shared library" ON)
+option(USE_CUBEB_FOR_AUDIO "Use Cubeb for audio instead of native SDL2" ON)
+option(ENABLE_INSTALL "Enable install" OFF)
 if(WIN32)
 option(INSTALL_MINGW_DEPENDENCIES "Add dependent libraries to MinGW install target" OFF)
 endif()
@@ -110,6 +112,15 @@ if(PLATFORM_WIN32)
 	set(XNASONG OFF)
 else()
 	set(PLATFORM_CFLAGS)
+endif()
+
+if (USE_CUBEB_FOR_AUDIO)
+	option(BUILD_TESTS "Build tests" OFF)
+	option(BUILD_TOOLS "Build tools" OFF)
+
+	add_subdirectory(cubeb)
+	add_definitions(-DFNA_USE_CUBEB_FOR_AUDIO)
+	target_link_libraries(FAudio PRIVATE cubeb)
 endif()
 
 # Only disable DebugConfiguration in release builds
@@ -271,50 +282,53 @@ if(BUILD_TESTS)
 	target_link_libraries(faudio_tests PRIVATE FAudio)
 endif()
 
-# Installation
+if (ENABLE_INSTALL)
+	# Installation
 
-# Public Headers...
-install(
-	DIRECTORY include/
-	DESTINATION ${FAudio_INSTALL_INCLUDEDIR}
-)
-# Libraries...
-install(
-	TARGETS ${PROJECT_NAME}
-	EXPORT ${PROJECT_NAME}-targets
-	INCLUDES DESTINATION ${FAudio_INSTALL_INCLUDEDIR}
-	RUNTIME DESTINATION ${FAudio_INSTALL_BINDIR}
-	LIBRARY DESTINATION ${FAudio_INSTALL_LIBDIR}
-	ARCHIVE DESTINATION ${FAudio_INSTALL_LIBDIR}
-)
+	# Public Headers...
+	install(
+		DIRECTORY include/
+		DESTINATION ${FAudio_INSTALL_INCLUDEDIR}
+	)
+	# Libraries...
+	install(
+		TARGETS ${PROJECT_NAME}
+		EXPORT ${PROJECT_NAME}-targets
+		INCLUDES DESTINATION ${FAudio_INSTALL_INCLUDEDIR}
+		RUNTIME DESTINATION ${FAudio_INSTALL_BINDIR}
+		LIBRARY DESTINATION ${FAudio_INSTALL_LIBDIR}
+		ARCHIVE DESTINATION ${FAudio_INSTALL_LIBDIR}
+	)
 
-# Generate a pkgconfig file
-include(cmake/JoinPaths.cmake)
-join_paths(FAUDIO_PKGCONF_LIBDIR "\${prefix}" "${CMAKE_INSTALL_LIBDIR}")
-join_paths(FAUDIO_PKGCONF_INCLUDEDIR "\${prefix}" "${CMAKE_INSTALL_INCLUDEDIR}")
-configure_file(
-	"${PROJECT_SOURCE_DIR}/cmake/${PROJECT_NAME}.pc.in"
-	${PROJECT_BINARY_DIR}/generated/${PROJECT_NAME}.pc
-	@ONLY
-)
-install(
-	FILES ${CMAKE_CURRENT_BINARY_DIR}/generated/${PROJECT_NAME}.pc
-	DESTINATION ${FAudio_INSTALL_LIBDIR}/pkgconfig
-)
+	# Generate a pkgconfig file
+	include(cmake/JoinPaths.cmake)
+	join_paths(FAUDIO_PKGCONF_LIBDIR "\${prefix}" "${CMAKE_INSTALL_LIBDIR}")
+	join_paths(FAUDIO_PKGCONF_INCLUDEDIR "\${prefix}" "${CMAKE_INSTALL_INCLUDEDIR}")
+	configure_file(
+		"${PROJECT_SOURCE_DIR}/cmake/${PROJECT_NAME}.pc.in"
+		${PROJECT_BINARY_DIR}/generated/${PROJECT_NAME}.pc
+		@ONLY
+	)
+	install(
+		FILES ${CMAKE_CURRENT_BINARY_DIR}/generated/${PROJECT_NAME}.pc
+		DESTINATION ${FAudio_INSTALL_LIBDIR}/pkgconfig
+	)
 
-# Generate cmake-config file, install CMake files
-include(CMakePackageConfigHelpers)
-configure_package_config_file(
-	cmake/config.cmake.in
-	${CMAKE_CURRENT_BINARY_DIR}/generated/${PROJECT_NAME}Config.cmake
-	INSTALL_DESTINATION ${FAudio_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}
-)
-install(
-	FILES ${CMAKE_CURRENT_BINARY_DIR}/generated/${PROJECT_NAME}Config.cmake
-	DESTINATION ${FAudio_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}
-)
-install(
-	EXPORT ${PROJECT_NAME}-targets
-	NAMESPACE ${PROJECT_NAME}::
-	DESTINATION ${FAudio_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}
-)
+	# Generate cmake-config file, install CMake files
+	include(CMakePackageConfigHelpers)
+	configure_package_config_file(
+		cmake/config.cmake.in
+		${CMAKE_CURRENT_BINARY_DIR}/generated/${PROJECT_NAME}Config.cmake
+		INSTALL_DESTINATION ${FAudio_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}
+	)
+	install(
+		FILES ${CMAKE_CURRENT_BINARY_DIR}/generated/${PROJECT_NAME}Config.cmake
+		DESTINATION ${FAudio_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}
+	)
+	install(
+		EXPORT ${PROJECT_NAME}-targets
+		NAMESPACE ${PROJECT_NAME}::
+		DESTINATION ${FAudio_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}
+	)
+
+endif()
