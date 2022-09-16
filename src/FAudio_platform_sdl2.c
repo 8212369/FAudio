@@ -203,7 +203,12 @@ static void FAudio_InitCubebInstance()
 	}
 
 	cubeb_init(&CubebContext, "FAudio", NULL);
-	cubeb_enumerate_devices(CubebContext, CUBEB_DEVICE_TYPE_OUTPUT, &CubebDeviceCollection);
+	if (cubeb_enumerate_devices(CubebContext, CUBEB_DEVICE_TYPE_OUTPUT, &CubebDeviceCollection) != CUBEB_OK){
+#if __ANDROID__ || TARGET_OS_IPHONE
+		CubebDeviceCollection.count = 1;
+		CubebDeviceCollection.device = NULL;
+#endif
+	}
 }
 
 void FAudio_PlatformAddRef()
@@ -224,7 +229,9 @@ void FAudio_PlatformRelease()
 {
 	CubebContextRefCount--;
 	if (CubebContextRefCount == 0) {
-		cubeb_device_collection_destroy(CubebContext, &CubebDeviceCollection);
+		if (CubebDeviceCollection.device != NULL) {
+			cubeb_device_collection_destroy(CubebContext, &CubebDeviceCollection);
+		}
 		cubeb_destroy(CubebContext);
 	}
 }
@@ -260,7 +267,7 @@ void FAudio_PlatformInit(
 	}
 
 	cubeb_devid outDeviceId = NULL;
-	if (deviceIndex != 0) {
+	if ((deviceIndex != 0) && CubebDeviceCollection.device) {
 		if (deviceIndex > CubebDeviceCollection.count) {
 			SDL_Log("Out-of-range device index given to platform init!");
 			return;
@@ -270,13 +277,14 @@ void FAudio_PlatformInit(
 	}
 
 	result = cubeb_stream_init(CubebContext, &streamCubeb->stream, "FAudio Stream \"Device\"",
-		NULL, outDeviceId, NULL, &outParams, latencyFrames, FAudio_INTERNAL_MixCallback, FNA_Internal_StateCallback,
+		NULL, NULL, outDeviceId, &outParams, latencyFrames, FAudio_INTERNAL_MixCallback, FNA_Internal_StateCallback,
 		audio);
 
 	if ((result != CUBEB_OK) || (streamCubeb->stream == NULL)) {
 		FAudio_PlatformRelease();
 
-		SDL_Log("Failed to create Cubeb stream!");
+		SDL_Log("Failed to create Cubeb stream! Freq=%d channels=%d err=%d", mixFormat->Format.nSamplesPerSec, mixFormat->Format.nChannels,
+			result);
 		return;
 	}
 
@@ -347,8 +355,8 @@ uint32_t FAudio_PlatformGetDeviceDetails(
 
 	details->DeviceID[0] = L'0' + index;
 
-	name = CubebDeviceCollection.device[index].friendly_name;
-	details->Role = FAudioNotDefaultDevice;
+	name = (CubebDeviceCollection.device != NULL) ? CubebDeviceCollection.device[index].friendly_name : "Default Device";
+	details->Role = (CubebDeviceCollection.device == NULL) ? FAudioGlobalDefaultDevice : FAudioNotDefaultDevice;
 
 	FAudio_UTF8_To_UTF16(
 		name,
@@ -376,13 +384,15 @@ uint32_t FAudio_PlatformGetDeviceDetails(
 		channels = 0;
 	}
 
-	if (rate <= 0)
-	{
-		rate = (int)CubebDeviceCollection.device[index].default_rate;
-	}
-	if (channels <= 0)
-	{
-		channels = (int)CubebDeviceCollection.device[index].max_channels;
+	if (CubebDeviceCollection.device != NULL) {
+		if (rate <= 0)
+		{
+			rate = (int)CubebDeviceCollection.device[index].default_rate;
+		}
+		if (channels <= 0)
+		{
+			channels = (int)CubebDeviceCollection.device[index].max_channels;
+		}
 	}
 
 	/* If we make it all the way here with no format, hardcode a sane one */
